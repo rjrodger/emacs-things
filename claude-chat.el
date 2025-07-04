@@ -194,7 +194,9 @@
              (file-content (buffer-string))
              (prompt (claude-chat-create-prompt instructions file-content
                                                 (or file-name "untitled")))
-             (target-buffer (current-buffer)))
+             (target-buffer (current-buffer))
+             (saved-point (point))
+             (saved-window-start (window-start)))
         (claude-chat-update-status "📋 Preparing prompt...")
         ;; Call Claude asynchronously
         (claude-chat-call-claude-async 
@@ -203,8 +205,15 @@
            (let ((new-content (claude-chat-extract-code-from-response response)))
              (claude-chat-update-status "✏️ Updating buffer...")
              (with-current-buffer target-buffer
-               (erase-buffer)
-               (insert new-content))
+               (let ((old-size (buffer-size)))
+                 (erase-buffer)
+                 (insert new-content)
+                 ;; Restore cursor position
+                 (goto-char (min saved-point (point-max)))
+                 ;; Restore window position if visible
+                 (when (get-buffer-window target-buffer)
+                   (set-window-start (get-buffer-window target-buffer) 
+                                     (min saved-window-start (point-max))))))
              (claude-chat-update-status "")
              (message "Buffer updated with Claude's response"))))))))
 
