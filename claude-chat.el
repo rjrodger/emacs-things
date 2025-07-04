@@ -27,6 +27,11 @@
 ;;    - Install from: https://github.com/anthropics/claude-code
 ;;    - Verify with: claude --version
 ;;
+;; 5. (Optional) For better real-time output, install 'expect' which provides 'unbuffer':
+;;    - macOS: brew install expect
+;;    - Ubuntu/Debian: sudo apt-get install expect
+;;    - The package will work without it, but output may be buffered
+;;
 ;; Basic usage:
 ;; 1. Enable claude-chat-mode in a buffer: M-x claude-chat-mode
 ;; 2. Add instructions as comments prefixed with "CLAUDE:" (customizable)
@@ -85,12 +90,18 @@
 
 (defun claude-chat-create-prompt (instructions file-content file-name)
   "Create a prompt for Claude with INSTRUCTIONS and FILE-CONTENT."
-  (concat "I'm working on the file " file-name "\n\n"
-          "Here's the current content:\n"
+  (concat "You are an AI assistant helping to edit code. You must:\n"
+          "1. Make the requested changes directly without asking for permission\n"
+          "2. ONLY modify the content of the current file shown below\n"
+          "3. Do NOT suggest creating or modifying any other files\n"
+          "4. Return ONLY the updated content of THIS file\n\n"
+          "Current file: " file-name "\n\n"
+          "File content:\n"
           "```\n" file-content "\n```\n\n"
-          "Please perform the following tasks:\n"
+          "Tasks to perform on THIS file:\n"
           (mapconcat (lambda (inst) (concat "- " inst)) instructions "\n")
-          "\n\nReturn the complete updated file content."))
+          "\n\nReturn the complete updated content of " file-name " with all requested changes applied. "
+          "Output ONLY the file content, nothing else."))
 
 (defun claude-chat-update-status (status)
   "Update Claude status in modeline."
@@ -108,15 +119,17 @@
     (with-temp-file temp-file
       (insert prompt))
     
-    ;; Start async process with unbuffered output
+    ;; Start async process (use unbuffer if available for real-time output)
     (claude-chat-update-status "🤖 Claude starting...")
-    (setq process 
-          (start-process-shell-command 
-           "claude-chat" 
-           output-buffer
-           (format "cat %s | unbuffer %s --print 2>&1"
-                   (shell-quote-argument temp-file)
-                   claude-chat-claude-command)))
+    (let ((unbuffer-cmd (if (executable-find "unbuffer") "unbuffer " "")))
+      (setq process 
+            (start-process-shell-command 
+             "claude-chat" 
+             output-buffer
+             (format "cat %s | %s%s --print 2>&1"
+                     (shell-quote-argument temp-file)
+                     unbuffer-cmd
+                     claude-chat-claude-command))))
     
     ;; Store temp-file in process property for cleanup
     (process-put process 'temp-file temp-file)
