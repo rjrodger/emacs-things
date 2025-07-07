@@ -42,10 +42,12 @@
 ;; Customization:
 ;; - Change the instruction prefix: (setq claude-chat-comment-prefix "AI:")
 ;; - Change the Claude command: (setq claude-chat-claude-command "claude")
+;; - Disable diff confirmation: (setq claude-chat-confirm-changes nil)
 
 ;;; Code:
 
 (require 'json)
+(require 'cl-lib)
 
 (defgroup claude-chat nil
   "Chat with Claude from your code files."
@@ -59,6 +61,11 @@
 (defcustom claude-chat-claude-command "claude"
   "Command to run Claude CLI."
   :type 'string
+  :group 'claude-chat)
+
+(defcustom claude-chat-confirm-changes t
+  "Whether to show diff and require confirmation before applying changes."
+  :type 'boolean
   :group 'claude-chat)
 
 (defvar claude-chat-instruction-regexp nil
@@ -183,6 +190,156 @@
       (match-string 1 response)
     response))
 
+
+(defface claude-chat-added-face
+  '((t :background "#2f4f2f" :foreground "#90ee90"))
+  "Face for added lines in diff display."
+  :group 'claude-chat)
+
+(defface claude-chat-removed-face
+  '((t :background "#4f2f2f" :foreground "#ffb6c1"))
+  "Face for removed lines in diff display."
+  :group 'claude-chat)
+
+(defface claude-chat-context-face
+  '((t :foreground "#808080"))
+  "Face for context lines in diff display."
+  :group 'claude-chat)
+
+(defun claude-chat-compute-line-diff (original-lines new-lines)
+  "Compute line-by-line differences between ORIGINAL-LINES and NEW-LINES.
+Returns a list of (type . line) where type is 'added, 'removed, or 'unchanged."
+  (let ((orig-idx 0)
+        (new-idx 0)
+        (result '()))
+    ;; Simple line-by-line comparison
+    (while (or (< orig-idx (length original-lines))
+               (< new-idx (length new-lines)))
+      (cond
+       ;; Both lines exist and are equal
+       ((and (< orig-idx (length original-lines))
+             (< new-idx (length new-lines))
+             (string= (nth orig-idx original-lines)
+                     (nth new-idx new-lines)))
+        (push (cons 'unchanged (nth orig-idx original-lines)) result)
+        (setq orig-idx (1+ orig-idx))
+        (setq new-idx (1+ new-idx)))
+       ;; Try to find matching line ahead
+       ((and (< orig-idx (length original-lines))
+             (< new-idx (length new-lines)))
+        ;; Check if current new line matches any upcoming original line
+        (let ((match-pos (cl-position (nth new-idx new-lines) 
+                                     original-lines 
+                                     :start orig-idx
+                                     :test #'string=)))
+          (if (and match-pos (< (- match-pos orig-idx) 5)) ; Look ahead max 5 lines
+              ;; Found match ahead - mark intervening lines as removed
+              (progn
+                (while (< orig-idx match-pos)
+                  (push (cons 'removed (nth orig-idx original-lines)) result)
+                  (setq orig-idx (1+ orig-idx)))
+                (push (cons 'unchanged (nth new-idx new-lines)) result)
+                (setq orig-idx (1+ orig-idx))
+                (setq new-idx (1+ new-idx)))
+            ;; No nearby match - check if original line matches ahead in new
+            (let ((new-match-pos (cl-position (nth orig-idx original-lines)
+                                            new-lines
+                                            :start new-idx
+                                            :test #'string=)))
+              (if (and new-match-pos (< (- new-match-pos new-idx) 5))
+                  ;; Found match in new lines - mark intervening as added
+                  (progn
+                    (while (< new-idx new-match-pos)
+                      (push (cons 'added (nth new-idx new-lines)) result)
+                      (setq new-idx (1+ new-idx)))
+                    (push (cons 'unchanged (nth orig-idx original-lines)) result)
+                    (setq orig-idx (1+ orig-idx))
+                    (setq new-idx (1+ new-idx)))
+                ;; No match - one removed, one added
+                (push (cons 'removed (nth orig-idx original-lines)) result)
+                (push (cons 'added (nth new-idx new-lines)) result)
+                (setq orig-idx (1+ orig-idx))
+                (setq new-idx (1+ new-idx)))))))
+       ;; Only original lines left - all removed
+       ((< orig-idx (length original-lines))
+        (push (cons 'removed (nth orig-idx original-lines)) result)
+        (setq orig-idx (1+ orig-idx)))
+       ;; Only new lines left - all added
+       ((< new-idx (length new-lines))
+        (push (cons 'added (nth new-idx new-lines)) result)
+        (setq new-idx (1+ new-idx)))))
+    (nreverse result)))
+
+(defun claude-chat-show-diff-and-confirm (original-content new-content file-name original-buffer)
+  "Show differences with color highlighting and ask for confirmation."
+  (let* ((diff-buffer (generate-new-buffer (format "*Claude Changes: %s*" file-name)))
+         (original-lines (split-string original-content "\n"))
+         (new-lines (split-string new-content "\n"))
+         (diff-data (claude-chat-compute-line-diff original-lines new-lines))
+         (confirmed nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer diff-buffer
+            ;; Set up the buffer
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (insert (format "Claude's proposed changes to: %s\n" file-name))
+              (insert "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+              (insert "Legend: ")
+              (insert (propertize "[-removed]" 'face 'claude-chat-removed-face))
+              (insert "  ")
+              (insert (propertize "[+added]" 'face 'claude-chat-added-face))
+              (insert "  ")
+              (insert (propertize "[unchanged]" 'face 'claude-chat-context-face))
+              (insert "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+              
+              ;; Add line numbers and content with appropriate faces
+              (let ((line-num 1)
+                    (removed-count 0)
+                    (added-count 0))
+                (dolist (item diff-data)
+                  (let ((type (car item))
+                        (line (cdr item)))
+                    (pcase type
+                      ('unchanged
+                       (insert (propertize (format "%4d  %s\n" line-num line)
+                                         'face 'claude-chat-context-face))
+                       (setq line-num (1+ line-num)))
+                      ('removed
+                       (insert (propertize (format "    - %s\n" line)
+                                         'face 'claude-chat-removed-face))
+                       (setq removed-count (1+ removed-count)))
+                      ('added
+                       (insert (propertize (format "%4d+ %s\n" line-num line)
+                                         'face 'claude-chat-added-face))
+                       (setq line-num (1+ line-num))
+                       (setq added-count (1+ added-count))))))
+                
+                (insert "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+                (insert (format "Summary: %d lines added, %d lines removed\n" added-count removed-count))
+                (insert "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"))
+              
+              ;; Make buffer read-only
+              (read-only-mode 1)
+              (goto-char (point-min))
+              
+              ;; Apply syntax highlighting from original mode
+              (when original-buffer
+                (let ((mode (buffer-local-value 'major-mode original-buffer)))
+                  (when (and mode (not (eq mode 'fundamental-mode)))
+                    (funcall mode))))))
+          
+          ;; Display the diff buffer
+          (pop-to-buffer diff-buffer)
+          
+          ;; Ask for confirmation
+          (setq confirmed (yes-or-no-p "Apply Claude's changes to the file? ")))
+      
+      ;; Clean up
+      (when (buffer-live-p diff-buffer)
+        (kill-buffer diff-buffer)))
+    confirmed))
+
 (defun claude-chat-process-current-buffer ()
   "Process Claude instructions in current buffer."
   (interactive)
@@ -203,19 +360,29 @@
          prompt
          (lambda (response)
            (let ((new-content (claude-chat-extract-code-from-response response)))
-             (claude-chat-update-status "✏️ Updating buffer...")
-             (with-current-buffer target-buffer
-               (let ((old-size (buffer-size)))
-                 (erase-buffer)
-                 (insert new-content)
-                 ;; Restore cursor position
-                 (goto-char (min saved-point (point-max)))
-                 ;; Restore window position if visible
-                 (when (get-buffer-window target-buffer)
-                   (set-window-start (get-buffer-window target-buffer) 
-                                     (min saved-window-start (point-max))))))
              (claude-chat-update-status "")
-             (message "Buffer updated with Claude's response"))))))))
+             (message "Received response from Claude, preparing diff...")
+             ;; Show diff and ask for confirmation if enabled
+             (if (or (not claude-chat-confirm-changes)
+                     (claude-chat-show-diff-and-confirm file-content new-content 
+                                                        (or file-name "untitled")
+                                                        target-buffer))
+                 (progn
+                   (claude-chat-update-status "✏️ Applying changes...")
+                   (with-current-buffer target-buffer
+                     (let ((old-size (buffer-size)))
+                       (erase-buffer)
+                       (insert new-content)
+                       ;; Restore cursor position
+                       (goto-char (min saved-point (point-max)))
+                       ;; Restore window position if visible
+                       (when (get-buffer-window target-buffer)
+                         (set-window-start (get-buffer-window target-buffer) 
+                                           (min saved-window-start (point-max))))))
+                   (claude-chat-update-status "")
+                   (message "Changes applied successfully"))
+               ;; User rejected changes
+               (message "Changes rejected - buffer unchanged")))))))))
 
 (defun claude-chat-remove-instructions ()
   "Remove all Claude instruction comments from current buffer."
